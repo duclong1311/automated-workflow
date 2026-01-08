@@ -35,10 +35,11 @@ teams-jira-ai/
 ├── utils/                 # Utilities
 │   ├── text_parser.py     # Text cleaning
 │   ├── date_parser.py     # Date parsing
-	 └── fallback_parser.py # Quick fallback
+│   └── fallback_parser.py # Quick fallback
 ├── handlers/              # Request handlers
 │   └── webhook_handler.py # Teams webhook
-├── main.py               # FastAPI app (entry)
+├── main_new.py           # FastAPI app (new)
+├── main.py               # Old version (backup)
 ├── common.py             # Old common (backup)
 └── .env                  # Environment variables
 ```
@@ -62,14 +63,19 @@ GEMINI_API_KEY=your_gemini_api_key
 
 ### 3. Chạy ứng dụng:
 
-**Sử dụng version hiện tại:**
+**Sử dụng version mới (recommended):**
 ```bash
-python main.py
+python main_new.py
 ```
 
 **Hoặc với uvicorn:**
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main_new:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Version cũ (backup):**
+```bash
+python main.py
 ```
 
 ## 📝 Ví dụ sử dụng
@@ -122,9 +128,9 @@ AI nhận diện:
 Health check
 ```json
 {
-	"message": "Teams Jira AI Bot is running",
-	"version": "2.0",
-	"status": "healthy"
+  "message": "Teams Jira AI Bot is running",
+  "version": "2.0",
+  "status": "healthy"
 }
 ```
 
@@ -134,15 +140,15 @@ Nhận message từ Teams và tạo Jira issue
 **Request:**
 ```json
 {
-	"text": "<at>JiraBot</at> Tạo task..."
+  "text": "<at>JiraBot</at> Tạo task..."
 }
 ```
 
 **Response:**
 ```json
 {
-	"type": "message",
-	"text": "✅ Đã tạo Task thành công!\n• Key: [PROJ-123](...)\n• Tiêu đề: ..."
+  "type": "message",
+  "text": "✅ Đã tạo Task thành công!\n• Key: [PROJ-123](...)\n• Tiêu đề: ..."
 }
 ```
 
@@ -178,3 +184,15 @@ pytest tests/
 - Validate inputs
 - Error handling toàn diện
 
+## 📄 License
+
+MIT
+
+## 👥 Contributors
+
+- Your Name
+
+## 📞 Support
+
+Issues: [GitHub Issues](link)
+Docs: [Wiki](link)
