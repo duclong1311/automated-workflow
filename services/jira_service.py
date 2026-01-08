@@ -474,3 +474,4 @@ class JiraService:
             import traceback
             logger.error(traceback.format_exc())
             return False
+            
