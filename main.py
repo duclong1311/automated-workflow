@@ -9,7 +9,7 @@ from jira import JIRA
 from google import genai
 from dotenv import load_dotenv
 from common import GEMINI_PARSE_PROMPT, Messages, Config
-
+from fastapi import Response
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -859,41 +859,78 @@ async def process_with_timeout(message_text, background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"❌ Lỗi: {e}")
         return {"success": False, "message": Messages.error(str(e))}
-
+@app.middleware("http")
+async def add_ngrok_skip_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["ngrok-skip-browser-warning"] = "true"
+    return response
 @app.post("/webhook/teams")
 async def teams_webhook(request: Request, background_tasks: BackgroundTasks):
+    headers = {"ngrok-skip-browser-warning": "true"}
+    body_bytes = await request.body()
+    logger.info(f"🔍 Dữ liệu thô nhận được: {body_bytes.decode()}")
     try:
         data = await request.json()
-        raw_text = data.get("text", "")
-        message_text = clean_teams_message(raw_text)
+        logger.info(f"🚀 Payload nhận từ Power Automate: {data}")
         
-        # Bỏ tag mention của bot
-        message_text = message_text.replace(Config.BOT_MENTION_NAME, "").strip()
+        # Sửa cách lấy dữ liệu để tránh lỗi 'NoneType' object has no attribute 'strip'
+        raw_text = data.get("text")
+        raw_text = raw_text.strip() if raw_text else ""
 
-        # Xử lý với timeout tổng 4s (để đảm bảo response <5s)
-        result = await asyncio.wait_for(
-            process_with_timeout(message_text, background_tasks),
-            timeout=Config.WEBHOOK_RESPONSE_TIMEOUT
-        )
+        if not raw_text:
+            logger.warning("⚠️ 'text' bị None hoặc rỗng.")
+            return {
+                "status": "warning",
+                "jira_message": "⚠️ Power Automate chưa gửi được nội dung tin nhắn. Hãy kiểm tra tab Expression."
+            }
+
+        # Nếu Power Automate gửi một chuỗi JSON (như logs), parse để lấy Subject / PlainText / Content / Link
+        subject = None
+        plain_text = None
+        html_content = None
+        link = None
+
+        nested = None
+        try:
+            nested = json.loads(raw_text)
+        except Exception:
+            nested = None
+
+        if isinstance(nested, dict):
+            # Hỗ trợ nhiều biến thể: teamsFlowRunContext.MessagePayload hoặc MessagePayload trực tiếp
+            mp = nested.get('teamsFlowRunContext', {}).get('MessagePayload') or nested.get('MessagePayload') or {}
+            # Body có thể nằm trong mp['Body']
+            body = mp.get('Body') or {}
+            subject = mp.get('Subject') or body.get('Subject')
+            plain_text = body.get('PlainText') or mp.get('PlainText')
+            html_content = body.get('Content') or mp.get('Content')
+            link = mp.get('LinkToMessage') or body.get('LinkToMessage')
+
+        # Nếu không parse được nested JSON, vẫn dùng raw_text as-is
+        # Xây dựng message_text sao cho dòng đầu là subject (nếu có) để đảm bảo summary chính xác
+        text_for_clean = html_content or plain_text or raw_text
+
+        if subject:
+            message_text = f"{subject}\n\n{text_for_clean}"
+        else:
+            message_text = text_for_clean
+
+        if link:
+            message_text = f"{message_text}\n\nLink: {link}"
+
+        # Làm sạch message (loại bỏ tag, ghép assignee nếu cần)
+        message_text = clean_teams_message(message_text)
+        result = await process_with_timeout(message_text, background_tasks)
         
         return {
-            "type": "message",
-            "text": result["message"]
+            "status": "success",
+            "jira_message": result["message"]
         }
         
-    except asyncio.TimeoutError:
-        logger.error("❌ Webhook timeout")
-        return {
-            "type": "message",
-            "text": Messages.error("Webhook timeout (>5s)")
-        }
     except Exception as e:
-        logger.error(f"❌ Lỗi webhook: {e}")
-        return {
-            "type": "message",
-            "text": Messages.error(str(e))
-        }
-
+        logger.error(f"❌ Lỗi xử lý Webhook: {e}")
+        return {"status": "error", "jira_message": f"❌ Lỗi: {str(e)}"}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
