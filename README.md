@@ -47,6 +47,7 @@ Các tham số cần điền:
 - `JIRA_PROJECT_KEY`: Mã dự án (Ví dụ: BUILDEE)
 - `GEMINI_API_KEY`: API key từ Google AI Studio
 - `ALLOWED_CHANNELS`: Danh sách Channel ID (phân tách bằng dấu phẩy)
+- `BITBUCKET_AUTO_COMMENT`: Bật/tắt comment tự động từ Bitbucket (mặc định: `true`). Đặt `false` để tắt comment tự động.
 
 Ví dụ `.env` (không lưu trữ công khai):
 
@@ -56,6 +57,7 @@ JIRA_API_TOKEN=xxxxxxxxxxxxxxxx
 JIRA_PROJECT_KEY=BUILDEE
 GEMINI_API_KEY=xxxxxxxxxxxxxxxx
 ALLOWED_CHANNELS=19:abcd1234@thread.tacv2,19:efgh5678@thread.tacv2
+BITBUCKET_AUTO_COMMENT=true
 ```
 
 ## Vận hành

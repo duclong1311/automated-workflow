@@ -4,12 +4,21 @@ import logging
 import re
 import html
 import asyncio
+import requests
+from io import BytesIO
+from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from jira import JIRA
 from google import genai
 from dotenv import load_dotenv
 from common import GEMINI_PARSE_PROMPT, Messages, Config
 from fastapi import Response
+import sys
+# Ensure project root is on sys.path so local packages import correctly when running main.py
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from handlers.bitbucket_handler import process_bitbucket_event
+from services.jira_service import JiraService
+from models.task_info import TaskInfo
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -22,13 +31,11 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "").strip()
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Khởi tạo Jira
-jira = None
-try:
-    jira = JIRA(server=JIRA_SERVER, token_auth=JIRA_API_TOKEN)
-    logger.info("✅ Kết nối Jira thành công.")
-except Exception as e:
-    logger.error(f"❌ Lỗi kết nối Jira: {e}")
+# Khởi tạo Jira Service (thay vì global jira)
+jira_service = JiraService()
+
+# Giữ biến jira global để backward compatibility (sẽ deprecated)
+jira = jira_service.jira if jira_service.jira else None
 
 client_ai = None
 try:
@@ -404,328 +411,10 @@ def quick_parse_fallback(text):
         'assignee': assignee
     }
 
-def find_epic(epic_identifier):
-    """Tìm epic trong Jira theo key hoặc name"""
-    if not epic_identifier or not jira:
-        logger.warning("⚠️ Epic identifier rỗng hoặc Jira chưa kết nối")
-        return None
-    
-    epic_identifier = epic_identifier.strip()
-    
-    try:
-        # Nếu là epic key (format: PROJ-123)
-        if re.match(r'^[A-Z]+-\d+$', epic_identifier):
-            try:
-                epic = jira.issue(epic_identifier)
-                if epic.fields.issuetype.name == 'Epic':
-                    logger.info(f"✅ Tìm thấy epic theo key: {epic.key} - {epic.fields.summary}")
-                    return epic
-                else:
-                    logger.warning(f"⚠️ {epic_identifier} không phải là Epic (type: {epic.fields.issuetype.name})")
-            except Exception as e:
-                logger.warning(f"⚠️ Không tìm thấy epic key {epic_identifier}: {e}")
-        
-        # Chuẩn hóa epic identifier 
-        epic_normalized = epic_identifier.upper().replace('-', '').replace('_', '')
-        
-        # Tìm theo epic name trong project
-        # Thử nhiều cách tìm (không dùng ~ với key vì không hỗ trợ)
-        search_queries = [
-            f'project = {JIRA_PROJECT_KEY} AND issuetype = Epic AND summary ~ "{epic_identifier}"',
-            f'project = {JIRA_PROJECT_KEY} AND issuetype = Epic AND summary ~ "{epic_normalized}"',
-        ]
-        
-        # Nếu epic_identifier có thể là key, thử tìm theo key trực tiếp
-        if re.match(r'^[A-Z]+-\d+$', epic_identifier):
-            search_queries.insert(0, f'project = {JIRA_PROJECT_KEY} AND issuetype = Epic AND key = "{epic_identifier}"')
-        
-        for jql in search_queries:
-            try:
-                epics = jira.search_issues(jql, maxResults=10)
-                
-                if epics:
-                    # Tìm exact match trước (theo summary hoặc key)
-                    for epic in epics:
-                        epic_summary_upper = epic.fields.summary.upper().replace('-', '').replace('_', '')
-                        epic_key_upper = epic.key.upper().replace('-', '')
-                        
-                        # So sánh normalized
-                        if (epic_normalized in epic_summary_upper or 
-                            epic_normalized in epic_key_upper or
-                            epic_identifier.upper() in epic.fields.summary.upper() or
-                            epic_identifier.upper() == epic.key.upper()):
-                            logger.info(f"✅ Tìm thấy epic theo name: {epic.key} - {epic.fields.summary}")
-                            return epic
-                    
-                    # Nếu không có exact match, lấy cái đầu tiên
-                    logger.info(f"✅ Tìm thấy epic (lấy đầu tiên): {epics[0].key} - {epics[0].fields.summary}")
-                    return epics[0]
-            except Exception as e:
-                logger.warning(f"⚠️ Lỗi khi tìm với JQL {jql}: {e}")
-                continue
-        
-        logger.warning(f"⚠️ Không tìm thấy epic: {epic_identifier}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Lỗi khi tìm epic: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
+# Đã xóa các hàm duplicate: find_epic, find_epic_link_field_id, update_issue_async
+# Sử dụng JiraService.find_epic(), JiraService._find_epic_link_field_id(), JiraService.update_issue() thay thế
 
-def find_epic_link_field_id(issue):
-    """Tìm field ID của epic link field"""
-    try:
-        # Thử các field ID phổ biến trước (nhanh hơn)
-        common_epic_fields = ['customfield_10014', 'customfield_10011', 'customfield_10016', 'customfield_10020', 'customfield_10104']
-        issue_fields = issue.raw['fields']
-        
-        for field_id in common_epic_fields:
-            if field_id in issue_fields:
-                logger.info(f"✅ Tìm thấy epic link field: {field_id}")
-                return field_id
-        
-        # Nếu không tìm thấy, thử tìm trong danh sách fields của Jira
-        try:
-            fields = jira.fields()
-            for field in fields:
-                if field['name'].lower() in ['epic link', 'parent link', 'epic']:
-                    logger.info(f"✅ Tìm thấy epic link field: {field['name']} ({field['id']})")
-                    return field['id']
-        except:
-            pass
-        
-        logger.warning(f"⚠️ Không tìm thấy epic link field, sẽ thử với field phổ biến nhất")
-        # Trả về field phổ biến nhất để thử
-        return 'customfield_10014'
-    except Exception as e:
-        logger.warning(f"⚠️ Không thể tìm epic link field: {e}")
-        return 'customfield_10014'  # Fallback
-
-def update_issue_async(issue_key, epic_link=None, assignee=None):
-    """Cập nhật issue với epic link và assignee trong background"""
-    logger.info(f"🔄 Bắt đầu cập nhật {issue_key}: epic={epic_link}, assignee={assignee}")
-    
-    try:
-        issue = jira.issue(issue_key)
-        update_fields = {}
-        
-        # Gắn epic link - PHẢI tìm trên Jira trước
-        if epic_link:
-            epic = find_epic(epic_link)
-            if epic:
-                logger.info(f"✅ Đã tìm thấy epic: {epic.key} - {epic.fields.summary}")
-                # Tìm epic link field ID
-                epic_field_id = find_epic_link_field_id(issue)
-                
-                if epic_field_id:
-                    # Thử nhiều format khác nhau
-                    formats_to_try = [
-                        epic.key,  # Format 1: string key
-                        {'key': epic.key},  # Format 2: dict với key
-                        {'id': epic.id},  # Format 3: dict với id
-                    ]
-                    
-                    epic_set = False
-                    for fmt in formats_to_try:
-                        try:
-                            update_fields[epic_field_id] = fmt
-                            epic_set = True
-                            break
-                        except Exception as e:
-                            continue
-                    
-                    if not epic_set:
-                        logger.error(f"❌ Không thể set epic link cho epic {epic.key}")
-            else:
-                logger.error(f"❌ KHÔNG tìm thấy epic '{epic_link}' trên Jira")
-        
-        # Gắn assignee - PHẢI tìm trên Jira trước
-        if assignee:
-            # Clean assignee: loại bỏ phần trong ngoặc đơn và thay thế \xa0 bằng space
-            assignee_clean = assignee.replace('\xa0', ' ').replace('\u00a0', ' ')  # Thay non-breaking space
-            assignee_clean = re.sub(r'\s*\([^)]+\)', '', assignee_clean).strip()
-            assignee_clean = re.sub(r'\s+', ' ', assignee_clean)  # Normalize spaces
-            try:
-                # Tìm user trên Jira theo nhiều cách
-                users = []
-                
-                # Tạo nhiều search queries khác nhau
-                search_queries = []
-                
-                # 1. Tên đầy đủ đã clean
-                search_queries.append(assignee_clean)
-                
-                # 2. Tên gốc
-                search_queries.append(assignee)
-                
-                # 3. Từng phần của tên (nếu có nhiều từ)
-                name_parts = assignee_clean.split()
-                if len(name_parts) > 1:
-                    # Thử với họ và tên (2 từ đầu)
-                    if len(name_parts) >= 2:
-                        search_queries.append(f"{name_parts[0]} {name_parts[1]}")
-                    # Thử với tên cuối (có thể là username)
-                    search_queries.append(name_parts[-1])
-                
-                # 4. Loại bỏ dấu tiếng Việt và lowercase
-                import unicodedata
-                def remove_accents(text):
-                    nfd = unicodedata.normalize('NFD', text)
-                    return ''.join(c for c in nfd if unicodedata.category(c) != 'Mn')
-                
-                assignee_no_accent = remove_accents(assignee_clean).lower()
-                if assignee_no_accent != assignee_clean.lower():
-                    search_queries.append(assignee_no_accent)
-                
-                # 5. Chỉ tên cuối (có thể là username)
-                if len(name_parts) > 1:
-                    last_name_no_accent = remove_accents(name_parts[-1]).lower()
-                    search_queries.append(last_name_no_accent)
-                
-                # Loại bỏ duplicates
-                search_queries = list(dict.fromkeys(search_queries))
-                
-                # Thử từng query
-                for query in search_queries:
-                    try:
-                        users = jira.search_users(query, maxResults=10)
-                        if users:
-                            break
-                    except Exception as e:
-                        continue
-                
-                if users:
-                    # Tìm user phù hợp nhất (exact match hoặc partial match)
-                    matched_user = None
-                    assignee_lower = assignee_clean.lower().strip()
-                    
-                    # Import để loại bỏ dấu
-                    import unicodedata
-                    def remove_accents(text):
-                        nfd = unicodedata.normalize('NFD', text)
-                        return ''.join(c for c in nfd if unicodedata.category(c) != 'Mn')
-                    
-                    assignee_no_accent = remove_accents(assignee_lower)
-                    
-                    for user in users:
-                        # Kiểm tra displayName - ưu tiên exact match
-                        if hasattr(user, 'displayName') and user.displayName:
-                            user_display = user.displayName
-                            # Loại bỏ phần trong ngoặc đơn khi so sánh
-                            user_display_clean = re.sub(r'\s*\([^)]+\)', '', user_display).strip()
-                            user_display_clean = user_display_clean.replace('\xa0', ' ').replace('\u00a0', ' ')
-                            user_display_clean = re.sub(r'\s+', ' ', user_display_clean)
-                            user_display_lower = user_display_clean.lower()
-                            user_display_no_accent = remove_accents(user_display_lower)
-                            
-                            # So sánh với nhiều cách
-                            match_reasons = []
-                            if assignee_lower == user_display_lower:
-                                match_reasons.append("exact match")
-                            elif assignee_no_accent == user_display_no_accent:
-                                match_reasons.append("exact match (no accent)")
-                            elif assignee_lower in user_display_lower:
-                                match_reasons.append("assignee in displayName")
-                            elif assignee_no_accent in user_display_no_accent:
-                                match_reasons.append("assignee in displayName (no accent)")
-                            else:
-                                # So sánh từng từ: nếu tất cả từ trong assignee đều có trong displayName
-                                assignee_words = set(assignee_lower.split())
-                                display_words = set(user_display_lower.split())
-                                if assignee_words and assignee_words.issubset(display_words):
-                                    match_reasons.append("all words match")
-                            
-                            if match_reasons:
-                                matched_user = user
-                                logger.info(f"✅ Tìm thấy user: {user.displayName}")
-                                break
-                        
-                        # Kiểm tra emailAddress
-                        if not matched_user and hasattr(user, 'emailAddress') and user.emailAddress:
-                            if assignee_lower in user.emailAddress.lower():
-                                matched_user = user
-                                logger.info(f"✅ Tìm thấy user theo email: {user.emailAddress}")
-                                break
-                        
-                        # Kiểm tra name
-                        if not matched_user and hasattr(user, 'name') and user.name:
-                            user_name_lower = user.name.lower()
-                            user_name_no_accent = remove_accents(user_name_lower)
-                            
-                            if (assignee_lower == user_name_lower or
-                                assignee_no_accent == user_name_no_accent or
-                                assignee_lower in user_name_lower):
-                                matched_user = user
-                                logger.info(f"✅ Tìm thấy user theo name: {user.name}")
-                                break
-                    
-                    # Nếu không có exact match, lấy user đầu tiên
-                    if not matched_user and users:
-                        matched_user = users[0]
-                        logger.info(f"✅ Lấy user đầu tiên: {matched_user.displayName if hasattr(matched_user, 'displayName') else matched_user.name}")
-                    
-                    if matched_user:
-                        # Thử nhiều format để gắn assignee
-                        assignee_formats = []
-                        
-                        # Format 1: accountId (Jira Cloud)
-                        if hasattr(matched_user, 'accountId') and matched_user.accountId:
-                            assignee_formats.append({'accountId': matched_user.accountId})
-                        
-                        # Format 2: name (Jira Server)
-                        if hasattr(matched_user, 'name') and matched_user.name:
-                            assignee_formats.append({'name': matched_user.name})
-                        
-                        # Format 3: key
-                        if hasattr(matched_user, 'key') and matched_user.key:
-                            assignee_formats.append({'name': matched_user.key})
-                        
-                        # Format 4: emailAddress
-                        if hasattr(matched_user, 'emailAddress') and matched_user.emailAddress:
-                            assignee_formats.append({'name': matched_user.emailAddress})
-                        
-                        # Thử từng format
-                        assignee_set = False
-                        for fmt in assignee_formats:
-                            try:
-                                update_fields['assignee'] = fmt
-                                assignee_set = True
-                                logger.info(f"✅ Đã set assignee: {matched_user.displayName if hasattr(matched_user, 'displayName') else matched_user.name}")
-                                break
-                            except Exception as e:
-                                continue
-                        
-                        if not assignee_set:
-                            logger.error(f"❌ Không thể set assignee cho user {matched_user}")
-                    else:
-                        logger.error(f"❌ KHÔNG tìm thấy user '{assignee_clean}' trên Jira")
-                else:
-                    logger.error(f"❌ KHÔNG tìm thấy user '{assignee}' trên Jira")
-                        
-            except Exception as e:
-                logger.error(f"❌ Lỗi khi tìm/gắn assignee: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-        
-        # Cập nhật issue nếu có thay đổi
-        if update_fields:
-            logger.info(f"📝 Cập nhật {issue_key} với fields: {update_fields}")
-            try:
-                issue.update(fields=update_fields)
-                logger.info(f"✅ Đã cập nhật thành công {issue_key}")
-            except Exception as e:
-                logger.error(f"❌ Lỗi khi update issue: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-        else:
-            logger.info(f"ℹ️ Không có gì để cập nhật cho {issue_key}")
-            
-    except Exception as e:
-        logger.error(f"❌ Lỗi khi cập nhật issue {issue_key}: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-async def process_with_timeout(message_text, background_tasks: BackgroundTasks):
+async def process_with_timeout(message_text, background_tasks: BackgroundTasks, media_urls=None, subject=None):
     """Xử lý với timeout để đảm bảo response trong <5s"""
     import time
     start_time = time.time()
@@ -751,97 +440,136 @@ async def process_with_timeout(message_text, background_tasks: BackgroundTasks):
         if not task_info:
             task_info = quick_parse_fallback(message_text)
 
-        # 2. Tạo Jira issue nhanh (chỉ với thông tin cơ bản để tránh timeout)
+        # Kiểm tra Jira connection và JIRA_PROJECT_KEY
+        if not jira_service.jira:
+            logger.error("❌ Jira chưa được kết nối")
+            return {"success": False, "message": Messages.error("Jira chưa được kết nối. Vui lòng kiểm tra cấu hình.")}
+        
+        if not JIRA_PROJECT_KEY:
+            logger.error("❌ JIRA_PROJECT_KEY chưa được cấu hình")
+            return {"success": False, "message": Messages.error("JIRA_PROJECT_KEY chưa được cấu hình.")}
+
+        # 2. Chuyển đổi dictionary thành TaskInfo model
         summary = task_info.get('summary', 'No summary')
         issue_type = task_info.get('issuetype', 'Task')
         
-        # Tạo issue dict với minimal fields trước
-        issue_dict = {
-            'project': {'key': JIRA_PROJECT_KEY},
-            'issuetype': {'name': issue_type}
-        }
-        
-        # Thêm các field khác (có thể bị lỗi nếu screen không cho phép)
-        try:
-            issue_dict['summary'] = summary
-            issue_dict['description'] = task_info.get('description', 'No description')
-            issue_dict['priority'] = {'name': task_info.get('priority', 'Medium')}
-        except Exception as e:
-            logger.warning(f"⚠️ Không thể thêm một số fields: {e}")
+        # Detect priority từ message
+        priority = task_info.get('priority', 'Medium')
+        if re.search(r'ưu\s*tiên\s*cao|high\s*priority|priority\s*high|urgent', message_text or '', re.IGNORECASE):
+            priority = 'High'
+        elif re.search(r'ưu\s*tiên\s*thấp|low\s*priority|priority\s*low', message_text or '', re.IGNORECASE):
+            priority = 'Low'
 
-        # Nếu là Epic, bắt buộc phải có Epic Name
-        if issue_type == 'Epic':
-            try:
-                issue_dict['customfield_10104'] = summary
-            except:
-                pass
+        # Try to detect due date in ISO format YYYY-MM-DD or DD/MM/YYYY
+        duedate = None
+        iso_match = re.search(r'(\d{4}-\d{2}-\d{2})', message_text or '')
+        if iso_match:
+            duedate = iso_match.group(1)
+        else:
+            # Look for DD/MM/YYYY or D/M/YYYY
+            dm_match = re.search(r'(\b\d{1,2}/\d{1,2}/\d{4}\b)', message_text or '')
+            if dm_match:
+                try:
+                    dt = datetime.strptime(dm_match.group(1), '%d/%m/%Y')
+                    # Convert to Jira-friendly ISO date YYYY-MM-DD
+                    duedate = dt.strftime('%Y-%m-%d')
+                except Exception:
+                    duedate = None
 
-        # Tạo issue ngay lập tức
+        # Tạo TaskInfo object
+        task_info_obj = TaskInfo(
+            summary=summary,
+            description=task_info.get('description', 'No description'),
+            issuetype=issue_type,
+            priority=priority,
+            epic_link=task_info.get('epic_link'),
+            assignee=task_info.get('assignee'),
+            due_date=duedate,
+            media_urls=list(media_urls) if media_urls else []
+        )
+
+        # Tạo issue ngay lập tức sử dụng JiraService
         jira_start = time.time()
         try:
             new_issue = await loop.run_in_executor(
                 None, 
-                lambda: jira.create_issue(fields=issue_dict)
+                lambda: jira_service.create_issue(task_info_obj)
             )
         except Exception as e:
-            # Nếu lỗi do fields không được phép, thử với minimal fields
-            error_str = str(e)
-            if 'cannot be set' in error_str or 'not on the appropriate screen' in error_str:
-                logger.warning(f"⚠️ Một số fields không được phép, thử với minimal fields...")
-                minimal_dict = {
-                    'project': {'key': JIRA_PROJECT_KEY},
-                    'issuetype': {'name': issue_type}
-                }
-                try:
-                    new_issue = await loop.run_in_executor(
-                        None,
-                        lambda: jira.create_issue(fields=minimal_dict)
-                    )
-                    # Sau đó update với các field khác trong background
-                    update_fields = {}
-                    if summary:
-                        update_fields['summary'] = summary
-                    if task_info.get('description'):
-                        update_fields['description'] = task_info.get('description')
-                    if update_fields:
-                        try:
-                            new_issue.update(fields=update_fields)
-                        except Exception as e2:
-                            logger.warning(f"⚠️ Không thể update fields sau khi tạo: {e2}")
-                except Exception as e2:
-                    logger.error(f"❌ Lỗi khi tạo issue với minimal fields: {e2}")
-                    raise
-            else:
-                raise
+            logger.error(f"❌ Lỗi khi tạo issue: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": Messages.error(f"Không thể tạo issue: {str(e)}")}
         
         jira_time = time.time() - jira_start
         logger.info(f"⏱️ Jira create time: {jira_time:.2f}s")
         
         issue_url = f"{JIRA_SERVER}/browse/{new_issue.key}"
         
-        # 3. Thêm background task để cập nhật epic link và assignee
-        epic_link = task_info.get('epic_link')
-        assignee = task_info.get('assignee')
-        
-        # Normalize: nếu epic_link là empty string hoặc None, set thành None
-        if epic_link and isinstance(epic_link, str) and epic_link.strip():
-            epic_link = epic_link.strip()
-        else:
-            epic_link = None
-            
-        if assignee and isinstance(assignee, str) and assignee.strip():
-            # Clean non-breaking space và normalize
-            assignee = assignee.replace('\xa0', ' ').replace('\u00a0', ' ')
-            assignee = re.sub(r'\s+', ' ', assignee).strip()
-        else:
-            assignee = None
-        
-        if epic_link or assignee:
-            logger.info(f"📋 Sẽ cập nhật {new_issue.key} trong background: epic={epic_link}, assignee={assignee}")
-            # FastAPI BackgroundTasks có thể chạy sync function trực tiếp
-            background_tasks.add_task(update_issue_async, new_issue.key, epic_link, assignee)
+        # 3. Cập nhật epic link và assignee trong background (nếu có)
+        # JiraService.create_issue đã xử lý basic fields, nhưng epic_link và assignee
+        # cần được update sau vì có thể cần tìm kiếm trên Jira
+        if task_info_obj.epic_link or task_info_obj.assignee:
+            logger.info(f"📋 Sẽ cập nhật {new_issue.key} trong background: epic={task_info_obj.epic_link}, assignee={task_info_obj.assignee}")
+            # Sử dụng JiraService.update_issue thay vì update_issue_async
+            background_tasks.add_task(jira_service.update_issue, new_issue.key, task_info_obj)
         else:
             logger.info(f"ℹ️ Không có epic_link hoặc assignee để cập nhật cho {new_issue.key}")
+
+        # Attach media files (images/videos) if any media URLs found
+        # Media URLs đã được xử lý trong JiraService.create_issue() thông qua task_info_obj.media_urls
+
+        # Nếu issue là Epic thì tạo đúng 4 task con với tên cố định và KHÔNG có description
+        if issue_type and issue_type.lower() == 'epic':
+            # Đợi một chút để Jira có thời gian commit/index epic mới trước khi tạo child
+            try:
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+            child_names = ['FE', 'BE', 'SQA', '[Estimate] những công việc ban đầu của estimate']
+
+            # Kiểm tra parent trên Jira: chỉ tạo child nếu parent thực sự có issuetype = Epic
+            try:
+                parent_is_epic = False
+                if jira_service.jira:
+                    parent_issue = jira_service.jira.issue(new_issue.key)
+                    if hasattr(parent_issue.fields, 'issuetype') and parent_issue.fields.issuetype.name.lower() == 'epic':
+                        parent_is_epic = True
+                    else:
+                        logger.warning(f"⚠️ Issue {new_issue.key} không phải Epic trên Jira (issuetype={getattr(parent_issue.fields, 'issuetype', None)})")
+                else:
+                    logger.warning("⚠️ Jira client chưa khởi tạo, bỏ qua kiểm tra issuetype cho parent epic")
+            except Exception as e:
+                logger.warning(f"⚠️ Không thể kiểm tra issuetype của {new_issue.key}: {e}")
+
+            if not parent_is_epic:
+                logger.info(f"ℹ️ Bỏ qua tạo child vì {new_issue.key} không phải Epic trên Jira")
+            else:
+                created_children = []
+                for name in child_names:
+                    child_task_info = TaskInfo(
+                        summary=name,
+                        description='',
+                        issuetype='Task',
+                        epic_link=new_issue.key  # Link đến epic cha
+                    )
+                    try:
+                        child = await loop.run_in_executor(
+                            None,
+                            lambda: jira_service.create_issue(child_task_info)
+                        )
+                        logger.info(f"✅ Tạo child issue {child.key} cho epic {new_issue.key}")
+                        created_children.append(child)
+                        # Đảm bảo child có epic link: nếu create_issue không set được, update trong background
+                        try:
+                            parent_summary = getattr(new_issue.fields, 'summary', None) or new_issue.key
+                            bg_task_info = TaskInfo(epic_link=parent_summary)
+                            background_tasks.add_task(jira_service.update_issue, child.key, bg_task_info)
+                            logger.info(f"ℹ️ Đã schedule update để gắn epic cho {child.key} (search by name: {parent_summary})")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Không thể schedule update epic cho {child.key}: {e}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Không thể tạo child {name}: {e}")
         
         total_time = time.time() - start_time
         logger.info(f"⏱️ Total processing time: {total_time:.2f}s")
@@ -910,6 +638,24 @@ async def teams_webhook(request: Request, background_tasks: BackgroundTasks):
         # Xây dựng message_text sao cho dòng đầu là subject (nếu có) để đảm bảo summary chính xác
         text_for_clean = html_content or plain_text or raw_text
 
+        # Extract media URLs from HTML or raw text (img/src, video/src, or direct links to media files)
+        media_urls = set()
+        try:
+            # img tags
+            for m in re.finditer(r'<img[^>]+src=[\'\"]([^\'\"]+)[\'\"]', raw_text or '', re.IGNORECASE):
+                media_urls.add(m.group(1))
+            # video tags
+            for m in re.finditer(r'<video[^>]+src=[\'\"]([^\'\"]+)[\'\"]', raw_text or '', re.IGNORECASE):
+                media_urls.add(m.group(1))
+            # source tags inside video/audio
+            for m in re.finditer(r'<source[^>]+src=[\'\"]([^\'\"]+)[\'\"]', raw_text or '', re.IGNORECASE):
+                media_urls.add(m.group(1))
+            # direct links to media files (jpg/png/gif/mp4/mov/webm)
+            for m in re.finditer(r'(https?://\S+?\.(?:png|jpe?g|gif|mp4|mov|webm))(?:\?|\s|\"|\'|$)', raw_text or '', re.IGNORECASE):
+                media_urls.add(m.group(1))
+        except Exception:
+            media_urls = set()
+
         if subject:
             message_text = f"{subject}\n\n{text_for_clean}"
         else:
@@ -920,7 +666,7 @@ async def teams_webhook(request: Request, background_tasks: BackgroundTasks):
 
         # Làm sạch message (loại bỏ tag, ghép assignee nếu cần)
         message_text = clean_teams_message(message_text)
-        result = await process_with_timeout(message_text, background_tasks)
+        result = await process_with_timeout(message_text, background_tasks, media_urls=list(media_urls), subject=subject)
         
         return {
             "status": "success",
@@ -930,6 +676,25 @@ async def teams_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"❌ Lỗi xử lý Webhook: {e}")
         return {"status": "error", "jira_message": f"❌ Lỗi: {str(e)}"}
+
+
+@app.post("/webhook/bitbucket")
+async def bitbucket_webhook(request: Request):
+    body_bytes = await request.body()
+    logger.info(f"🔍 Bitbucket raw: {body_bytes.decode()}")
+    try:
+        data = await request.json()
+    except Exception as e:
+        logger.error(f"❌ JSON parse error from Bitbucket: {e}")
+        return {"status": "error", "message": "Invalid JSON"}
+
+    try:
+        result = process_bitbucket_event(data)
+        status = "success" if result.get("success") else "error"
+        return {"status": status, "result": result}
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý Bitbucket webhook: {e}")
+        return {"status": "error", "message": str(e)}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

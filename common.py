@@ -19,13 +19,19 @@ IMPORTANT RULES:
    - "Bug" if text has "Bug"|"lỗi"|"bug"
    - "Task" for everything else (including when text says "epic link" or "link to epic" - that's just linking, not creating Epic)
    
-2. epic_link: 
+2. priority:
+   - "High" if text has "ưu tiên cao"|"high priority"|"urgent"|"priority high"|"Ưu tiên cao"
+   - "Low" if text has "ưu tiên thấp"|"low priority"|"priority low"|"Ưu tiên thấp"
+   - "Medium" otherwise
+   - Look in both subject and description
+   
+3. epic_link: 
    - Extract epic key (format: PROJ-123, DXAI-456) or epic name (e.g. "DXAI", "DX-AI") 
    - Look for phrases like "epic link", "link to epic", "epic:", "epic=", "gán epic", "epic link đến"
    - Examples: "epic link DXAI" -> epic_link: "DXAI", "epic link đến PROJ-123" -> epic_link: "PROJ-123"
    - If epic_link exists, issuetype should be "Task" (not "Epic")
    
-3. assignee:
+4. assignee:
    - Extract when text says "assign to", "gán cho", "assignee:", "assign:", "gán task này cho"
    - Extract name or email after these phrases
    - Examples: "gán cho Lê Đức Anh" -> assignee: "Lê Đức Anh", "assign to john@example.com" -> assignee: "john@example.com"
