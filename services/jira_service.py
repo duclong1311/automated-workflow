@@ -133,7 +133,7 @@ class JiraService:
             else:
                 raise
     
-    def update_issue(self, issue_key: str, task_info: TaskInfo):
+    def update_issue(self, issue_key: str, task_info: TaskInfo, epic_issue=None):
         """
         Cập nhật issue với thông tin bổ sung (background task)
         Xử lý từng field riêng biệt để nếu một field fail thì các field khác vẫn được update
@@ -147,6 +147,8 @@ class JiraService:
             
             # 1. Gắn epic link - thử nhiều field IDs và formats
             if task_info.epic_link:
+                # Đợi một chút để đảm bảo epic đã được tạo và index
+                time.sleep(2)
                 epic_field_ids = self._find_all_epic_link_fields(issue)
 
                 # Prepare formats to try. If the provided epic_link looks like a key (PROJ-123),
@@ -159,11 +161,12 @@ class JiraService:
                     ])
 
                 # Try to resolve epic object to get numeric id if possible
-                epic_obj = None
-                try:
-                    epic_obj = self.find_epic(task_info.epic_link)
-                except Exception:
-                    epic_obj = None
+                epic_obj = epic_issue
+                if not epic_obj:
+                    try:
+                        epic_obj = self.find_epic(task_info.epic_link)
+                    except Exception:
+                        epic_obj = None
 
                 if epic_obj:
                     logger.info(f"✅ Đã tìm thấy epic: {epic_obj.key} - {epic_obj.fields.summary}")
@@ -225,10 +228,11 @@ class JiraService:
                             assignee_set = True
                             break
                         except Exception as e:
+                            logger.warning(f"⚠️ Thử set assignee với {fmt} thất bại: {e}")
                             continue
                     
                     if not assignee_set:
-                        logger.warning(f"⚠️ Không thể set assignee cho {issue_key}")
+                        logger.warning(f"⚠️ Không thể set assignee cho {issue_key} (đã thử {len(assignee_formats)} formats)")
                         failed_fields.append('assignee')
             
             # 3. Cập nhật priority
@@ -295,6 +299,9 @@ class JiraService:
         epic_identifier = epic_identifier.strip()
         
         try:
+            # Extract possible key from the identifier
+            possible_keys = re.findall(r'\b([A-Z]+-\d+)\b', epic_identifier)
+            
             # Nếu là epic key - thử nhiều lần vì Jira có thể chưa index ngay lập tức
             if re.match(r'^[A-Z]+-\d+$', epic_identifier):
                 for attempt in range(3):
@@ -303,18 +310,41 @@ class JiraService:
                         if epic and hasattr(epic.fields, 'issuetype') and epic.fields.issuetype.name == 'Epic':
                             logger.info(f"✅ Tìm thấy epic theo key: {epic.key}")
                             return epic
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"⚠️ Attempt {attempt + 1} failed to get issue {epic_identifier}: {e}")
                         # Chờ một chút rồi thử lại
                         if attempt < 2:
                             time.sleep(1)
                         continue
             
-            # Tìm theo name
+            # Try extracted keys
+            for key in possible_keys:
+                for attempt in range(3):
+                    try:
+                        epic = self.jira.issue(key)
+                        if epic and hasattr(epic.fields, 'issuetype') and epic.fields.issuetype.name == 'Epic':
+                            logger.info(f"✅ Tìm thấy epic theo extracted key: {epic.key}")
+                            return epic
+                    except Exception as e:
+                        logger.warning(f"⚠️ Attempt {attempt + 1} failed to get extracted key {key}: {e}")
+                        if attempt < 2:
+                            time.sleep(1)
+                        continue
+            
+            # Tìm theo name - thử nhiều cách
             epic_normalized = epic_identifier.upper().replace('-', '').replace('_', '')
             
+            # Remove common prefixes like [Ưu tiên thấp], [High], etc.
+            clean_name = re.sub(r'^\s*\[.*?\]\s*', '', epic_identifier).strip()
+            clean_name_normalized = clean_name.upper().replace('-', '').replace('_', '')
+            
             search_queries = [
+                f'issuetype = Epic AND summary ~ "{epic_identifier}"',
+                f'issuetype = Epic AND summary ~ "{clean_name}"',
+                f'issuetype = Epic AND summary ~ "{epic_normalized}"',
+                f'issuetype = Epic AND summary ~ "{clean_name_normalized}"',
                 f'project = {settings.JIRA_PROJECT_KEY} AND issuetype = Epic AND summary ~ "{epic_identifier}"',
-                f'project = {settings.JIRA_PROJECT_KEY} AND issuetype = Epic AND summary ~ "{epic_normalized}"',
+                f'project = {settings.JIRA_PROJECT_KEY} AND issuetype = Epic AND summary ~ "{clean_name}"',
             ]
             
             for jql in search_queries:
@@ -323,11 +353,18 @@ class JiraService:
                     if epics:
                         for epic in epics:
                             epic_summary_upper = epic.fields.summary.upper().replace('-', '').replace('_', '')
-                            if epic_normalized in epic_summary_upper or epic_identifier.upper() in epic.fields.summary.upper():
-                                logger.info(f"✅ Tìm thấy epic: {epic.key}")
+                            # Check various matches
+                            if (epic_normalized in epic_summary_upper or 
+                                epic_identifier.upper() in epic.fields.summary.upper() or
+                                clean_name_normalized in epic_summary_upper or
+                                clean_name.upper() in epic.fields.summary.upper()):
+                                logger.info(f"✅ Tìm thấy epic: {epic.key} - {epic.fields.summary}")
                                 return epic
+                        # If no exact match, return first result
+                        logger.info(f"✅ Tìm thấy possible epic: {epics[0].key} - {epics[0].fields.summary}")
                         return epics[0]
-                except:
+                except Exception as e:
+                    logger.warning(f"⚠️ JQL failed: {jql} - {e}")
                     continue
             
             logger.warning(f"⚠️ Không tìm thấy epic: {epic_identifier}")
@@ -379,6 +416,7 @@ class JiraService:
         if not epic_field_ids:
             epic_field_ids = ['customfield_10014']
         
+        logger.debug(f"🔍 Found epic field IDs: {epic_field_ids}")
         return epic_field_ids
     
     def _find_user(self, assignee: str):

@@ -3,3 +3,10 @@ venv/
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# ML models - too large for GitHub
+ml/models/
+ml/data/training_data.jsonl
+*.pt
+*.pth
+*.ckpt
